@@ -1,6 +1,9 @@
 import telebot
 from telebot import types
 import os
+import time
+import re
+import threading  # Добавляем для асинхронной рассылки
 
 # ========================================
 # НАСТРОЙКИ БОТА — ИЗМЕНИТЕ ЭТИ ЗНАЧЕНИЯ
@@ -143,7 +146,7 @@ def start_message(message):
             "🔓 `/unban <user_id>`\n"
             "Разблокировать пользователя\n\n"
             "📢 `/broadcast <текст>`\n"
-            "Массовая рассылка (в разработке)\n\n"
+            "Массовая рассылка всем пользователям\n\n"
             "ℹ️ `/help`\n"
             "Показать эту справку\n\n"
             "💡 *Совет:* ID пользователя есть в каждом пересланном запросе!"
@@ -156,9 +159,6 @@ def start_message(message):
 # ========================================
 # СИСТЕМА БАНОВ (с поддержкой временных)
 # ========================================
-
-import time
-import re
 
 BAN_LIST_FILE = 'banned_users.txt'
 # Структура: {user_id: expiry_timestamp} где expiry_timestamp = None (постоянный) или число (время окончания)
@@ -265,7 +265,7 @@ def admin_panel(message):
         "🔓 `/unban <user_id>`\n"
         "Разблокировать пользователя\n\n"
         "📢 `/broadcast <текст>`\n"
-        "Массовая рассылка (в разработке)\n\n"
+        "Массовая рассылка всем пользователям\n\n"
         "ℹ️ `/help`\n"
         "Показать эту справку\n\n"
         "💡 *Совет:* ID пользователя есть в каждом пересланном запросе!"
@@ -310,6 +310,9 @@ def reply_to_user(message):
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Ошибка при отправке: {e}")
 
+# ========================================
+# МАССОВАЯ РАССЫЛКА (реализована)
+# ========================================
 
 @bot.message_handler(commands=['broadcast'])
 def broadcast_message(message):
@@ -320,18 +323,53 @@ def broadcast_message(message):
     if len(parts) < 2:
         bot.send_message(
             message.chat.id,
-            "❌ Формат: `/broadcast <сообщение>`",
+            "❌ Формат: `/broadcast <сообщение>`\n\n"
+            "Вы можете использовать Markdown для форматирования.",
             parse_mode='Markdown'
         )
         return
 
+    broadcast_text = parts[1]
+
+    # Получаем список пользователей, исключая забаненных
+    recipients = [uid for uid in all_users if not is_banned(uid)]
+    if not recipients:
+        bot.send_message(message.chat.id, "⚠️ Нет пользователей для рассылки.")
+        return
+
+    # Подтверждение и запуск рассылки в фоне
     bot.send_message(
         message.chat.id,
-        "⚠️ Функция массовой рассылки требует базы данных пользователей.\n"
-        "Используйте `/reply <user_id> <текст>` для ответа конкретному пользователю.",
-        parse_mode='Markdown'
+        f"📢 Начинаю рассылку {len(recipients)} пользователям.\n"
+        "Это может занять некоторое время. По завершении будет отправлен отчёт."
     )
 
+    def send_broadcast():
+        success_count = 0
+        fail_count = 0
+        for uid in recipients:
+            try:
+                bot.send_message(uid, broadcast_text, parse_mode='Markdown')
+                success_count += 1
+            except Exception:
+                fail_count += 1
+            # Небольшая задержка, чтобы не превысить лимиты Telegram
+            time.sleep(0.05)
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ Рассылка завершена.\n"
+            f"Успешно: {success_count}\n"
+            f"Ошибок: {fail_count}\n"
+            f"Всего: {len(recipients)}"
+        )
+
+    # Запускаем в отдельном потоке, чтобы не блокировать бота
+    threading.Thread(target=send_broadcast).start()
+
+# ========================================
+# ОСТАЛЬНЫЕ КОМАНДЫ (без изменений)
+# ========================================
 
 @bot.message_handler(commands=['ban'])
 def ban_user(message):
@@ -383,7 +421,6 @@ def ban_user(message):
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
 
-
 @bot.message_handler(commands=['unban'])
 def unban_user(message):
     """Разблокирует пользователя по ID."""
@@ -402,12 +439,10 @@ def unban_user(message):
 
         user_id = int(parts[1])
 
-        if not is_banned(user_id):  # is_banned автоматически удалит истекшие, но если пользователя нет в словаре — вернёт False
-            # Проверим напрямую в словаре, может он есть но истекший? Но is_banned уже удалил бы.
+        if not is_banned(user_id):
             if user_id not in banned_users:
                 bot.send_message(message.chat.id, f"⚠️ Пользователь {user_id} не в бане.")
             else:
-                # Если is_banned вернул False, значит бан истек и уже удалён. Сообщим.
                 bot.send_message(message.chat.id, f"⚠️ Пользователь {user_id} не в бане (возможно, срок истёк).")
             return
 
@@ -429,28 +464,26 @@ def unban_user(message):
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
 
-
 @bot.message_handler(commands=['help'])
 def help_admin(message):
     if message.chat.id not in ADMIN_IDS:
         return
     admin_text = (
-    "👨‍💼 *АДМИН КОМАНДЫ*\n\n"
-    "📝 `/reply <user_id> <текст>`\n"
-    "Ответить конкретному пользователю\n\n"
-    "🔨 `/ban <user_id> [причина]`\n"
-    "Заблокировать пользователя\n\n"
-    "⏳ `/tempban <user_id> <длительность> [причина]`\n"
-    "Временный бан (пример: 30m, 2h, 5d)\n\n"
-    "🔓 `/unban <user_id>`\n"
-    "Разблокировать пользователя\n\n"
-    "📢 `/broadcast <текст>`\n"
-    "Массовая рассылка (в разработке)\n\n"
-    "ℹ️ `/help`\n"
-    "Показать эту справку\n\n"
-    "💡 *Совет:* ID пользователя есть в каждом пересланном запросе!"
-)
-
+        "👨‍💼 *АДМИН КОМАНДЫ*\n\n"
+        "📝 `/reply <user_id> <текст>`\n"
+        "Ответить конкретному пользователю\n\n"
+        "🔨 `/ban <user_id> [причина]`\n"
+        "Заблокировать пользователя\n\n"
+        "⏳ `/tempban <user_id> <длительность> [причина]`\n"
+        "Временный бан (пример: 30m, 2h, 5d)\n\n"
+        "🔓 `/unban <user_id>`\n"
+        "Разблокировать пользователя\n\n"
+        "📢 `/broadcast <текст>`\n"
+        "Массовая рассылка всем пользователям\n\n"
+        "ℹ️ `/help`\n"
+        "Показать эту справку\n\n"
+        "💡 *Совет:* ID пользователя есть в каждом пересланном запросе!"
+    )
     bot.send_message(message.chat.id, admin_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['tempban'])
@@ -478,12 +511,10 @@ def tempban_user(message):
             bot.send_message(message.chat.id, "❌ Нельзя забанить администратора!")
             return
 
-        # Проверяем, не забанен ли уже
         if is_banned(user_id):
             bot.send_message(message.chat.id, f"⚠️ Пользователь {user_id} уже забанен.")
             return
 
-        # Парсим длительность
         seconds = parse_duration(duration_str)
         if seconds is None:
             bot.send_message(
@@ -496,10 +527,8 @@ def tempban_user(message):
         banned_users[user_id] = expiry
         save_banned_users()
 
-        # Очищаем состояние пользователя
         user_states.pop(user_id, None)
 
-        # Форматируем человекочитаемое время окончания
         expiry_readable = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(expiry))
 
         bot.send_message(
@@ -507,7 +536,6 @@ def tempban_user(message):
             f"✅ Пользователь {user_id} забанен до {expiry_readable}.\nПричина: {reason}"
         )
 
-        # Уведомляем пользователя
         try:
             bot.send_message(
                 user_id,
@@ -521,9 +549,7 @@ def tempban_user(message):
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
 
-
-
-# ─── АНКЕТЫ ───────────────────────────────────────────────────────────────────
+# ─── АНКЕТЫ (без изменений) ───────────────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text == '📋 Команда проекта')
 def project_team_request(message):
@@ -556,7 +582,6 @@ def project_team_request(message):
     )
     bot.send_message(message.chat.id, application_text, parse_mode='Markdown')
 
-
 @bot.message_handler(func=lambda m: m.text == '🎥 YT / Медиа')
 def youtube_application(message):
     if is_banned(message.chat.id):
@@ -588,7 +613,6 @@ def youtube_application(message):
     )
     bot.send_message(message.chat.id, youtube_text, parse_mode='Markdown')
 
-
 @bot.message_handler(func=lambda m: m.text == '📱 TT / TT+')
 def tiktok_application(message):
     if is_banned(message.chat.id):
@@ -619,7 +643,6 @@ def tiktok_application(message):
     )
     bot.send_message(message.chat.id, tiktok_text, parse_mode='Markdown')
 
-
 # ─── ЖАЛОБЫ ───────────────────────────────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text == '⚠️ Жалоба')
@@ -638,7 +661,6 @@ def complaint_handler(message):
         reply_markup=markup,
         parse_mode='Markdown'
     )
-
 
 @bot.message_handler(func=lambda m: m.text == '👤 Жалоба на игрока')
 def player_complaint(message):
@@ -681,7 +703,6 @@ def staff_complaint(message):
     )
     bot.send_message(message.chat.id, complaint_text, parse_mode='Markdown')
 
-
 # ─── ТЕХ. ПОДДЕРЖКА И ПОМОЩЬ ─────────────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text == '🛠 Тех.поддержка')
@@ -697,7 +718,6 @@ def tech_support_request(message):
         "• Когда это произошло",
         parse_mode='Markdown'
     )
-
 
 @bot.message_handler(func=lambda m: m.text == '❓ Помощь')
 def help_command(message):
@@ -718,7 +738,6 @@ def help_command(message):
 def back_to_menu(message):
     user_states.pop(message.chat.id, None)
     show_main_menu(message)
-
 
 # ─── ОБРАБОТКА ВХОДЯЩИХ ЗАЯВОК/ЖАЛОБ ─────────────────────────────────────────
 
@@ -747,7 +766,7 @@ def handle_requests(message):
 
     is_support = (state == 'awaiting_support_request')
     target_chat = SUPPORT_CHAT_ID if is_support else STAFF_CHAT_ID
-    thread_id = SUPPORT_THREAD_ID if is_support else STAFF_THREAD_ID   # <-- добавили
+    thread_id = SUPPORT_THREAD_ID if is_support else STAFF_THREAD_ID
 
     request_header = (
         f"📩 *Новый запрос*\n"
@@ -761,7 +780,7 @@ def handle_requests(message):
     try:
         if message.content_type == 'text':
             bot.send_message(target_chat, request_header + message.text,
-                             parse_mode='Markdown', message_thread_id=thread_id)   # <-- добавили thread_id
+                             parse_mode='Markdown', message_thread_id=thread_id)
         elif message.content_type == 'photo':
             bot.send_photo(target_chat, message.photo[-1].file_id,
                            caption=request_header + (message.caption or ''),
